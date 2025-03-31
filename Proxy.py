@@ -4,6 +4,7 @@ import sys
 import os
 import argparse
 import re
+import time  # For handling cache control headers timestamps
 
 # 1MB buffer size
 BUFFER_SIZE = 1000000
@@ -44,6 +45,185 @@ except:
   print ('Failed to listen')
   sys.exit()
 
+# Step 8: Helper function for parsing response headers
+def parse_headers(response):
+    # Find the separator between headers and body
+    header_end = response.find(b'\r\n\r\n')
+    if header_end == -1:
+        return {}, response
+    
+    headers_raw = response[:header_end].decode('latin-1', errors='replace')
+    body = response[header_end + 4:]  # Skip \r\n\r\n
+    
+    # Parse headers
+    headers = {}
+    lines = headers_raw.split('\r\n')
+    status_line = lines[0]
+    headers['status'] = status_line
+    
+    # Get status code
+    try:
+        status_code = int(status_line.split()[1])
+        headers['status_code'] = status_code
+    except (IndexError, ValueError):
+        headers['status_code'] = 0
+    
+    # Parse other headers
+    for line in lines[1:]:
+        if ':' in line:
+            key, value = line.split(':', 1)
+            headers[key.strip().lower()] = value.strip()
+    
+    return headers, body
+
+# Step 8: Check cache control headers and if response should be cached
+def should_cache_response(headers):
+    # Check status code
+    status_code = headers.get('status_code', 0)
+    
+    # According to HTTP specification:
+    # 200 OK - Cacheable
+    # 301 Moved Permanently - Cacheable
+    # 302 Found - Not cacheable unless explicitly indicated
+    # 304 Not Modified - Cacheable
+    # 404 Not Found - Not cacheable unless explicitly indicated
+    
+    # Get Cache-Control header
+    cache_control = headers.get('cache-control', '')
+    
+    # Check for explicit no-cache directives
+    if 'no-store' in cache_control or 'no-cache' in cache_control:
+        print(f"Response has no-store or no-cache directive, not caching")
+        return False
+    
+    # Check max-age directive
+    max_age = None
+    if 'max-age=' in cache_control:
+        max_age_part = cache_control.split('max-age=')[1]
+        try:
+            max_age = int(max_age_part.split(',')[0].strip())
+            print(f"Found max-age directive: {max_age} seconds")
+            if max_age == 0:
+                print("Response has max-age=0, not caching")
+                return False
+        except (ValueError, IndexError):
+            pass
+    
+    # Handle various status codes
+    if status_code == 200:
+        # 200 OK - Cacheable by default
+        return True
+    elif status_code == 301:
+        # 301 Moved Permanently - Cacheable by default
+        print("301 response cached by default")
+        return True
+    elif status_code == 304:
+        # 304 Not Modified - Cacheable by default, but need to update existing cache
+        print("304 Not Modified response - updating cache")
+        return True
+    elif status_code in [302, 307, 404]:
+        # These status codes are not cached unless explicitly indicated
+        if 'public' in cache_control or 'private' in cache_control or max_age is not None:
+            print(f"{status_code} response cached due to explicit cache directive")
+            return True
+        else:
+            print(f"{status_code} response not cached (no explicit caching directive)")
+            return False
+    
+    # Other status codes are not cached by default
+    print(f"Status code {status_code} not cached by default")
+    return False
+
+# Step 8: Enhanced cache saving function with timestamp
+def save_to_cache(response, cache_location):
+    try:
+        # Parse headers and body
+        headers, body = parse_headers(response)
+        
+        if should_cache_response(headers):
+            # Create cache directory if it doesn't exist
+            cache_dir = os.path.dirname(cache_location)
+            if not os.path.exists(cache_dir):
+                os.makedirs(cache_dir)
+            
+            # Add cache timestamp header
+            timestamp = int(time.time())
+            header_addition = f"X-Cached-Timestamp: {timestamp}\r\n"
+            
+            # Find header end position
+            header_end = response.find(b'\r\n\r\n')
+            if header_end != -1:
+                # Insert timestamp between headers and body
+                new_response = response[:header_end] + header_addition.encode('latin-1') + response[header_end:]
+                
+                # Save to cache file
+                with open(cache_location, 'wb') as cache_file:
+                    cache_file.write(new_response)
+                print(f"Response cached with timestamp: {timestamp}")
+                return True
+            else:
+                # Cannot parse headers
+                with open(cache_location, 'wb') as cache_file:
+                    cache_file.write(response)
+                print("Response cached without modification (could not parse headers)")
+                return True
+        return False
+    except Exception as e:
+        print(f"Error saving to cache: {str(e)}")
+        return False
+
+# Step 8: Check if cache is expired
+def is_cache_valid(cache_location):
+    try:
+        with open(cache_location, 'r') as cache_file:
+            content = cache_file.read()
+            
+            # Look for timestamp header
+            timestamp_match = re.search(r'X-Cached-Timestamp:\s*(\d+)', content)
+            if timestamp_match:
+                timestamp = int(timestamp_match.group(1))
+                current_time = int(time.time())
+                age = current_time - timestamp
+                
+                # Look for max-age directive
+                max_age_match = re.search(r'Cache-Control:.*?max-age=(\d+)', content, re.IGNORECASE)
+                if max_age_match:
+                    max_age = int(max_age_match.group(1))
+                    if age > max_age:
+                        print(f"Cache expired: Age {age}s > max-age {max_age}s")
+                        return False
+                    else:
+                        print(f"Cache valid: Age {age}s <= max-age {max_age}s")
+                        return True
+            
+            # If no timestamp or max-age found, default to valid cache
+            return True
+    except Exception as e:
+        print(f"Error checking cache validity: {str(e)}")
+        return False
+
+# Step 9: Add Via header
+def add_via_header(response):
+    try:
+        # Find header end position
+        header_end = response.find(b'\r\n\r\n')
+        if header_end != -1:
+            headers = response[:header_end].decode('latin-1', errors='replace')
+            body = response[header_end + 4:]
+            
+            # Check if Via header already exists
+            if 'via:' not in headers.lower():
+                # Add Via header
+                via_header = f"Via: 1.1 {proxyHost}:{proxyPort} (Python-Proxy)\r\n"
+                new_response = response[:header_end] + via_header.encode('latin-1') + b'\r\n\r\n' + body
+                return new_response
+        
+        # If cannot parse or Via header already exists, return original response
+        return response
+    except Exception as e:
+        print(f"Error adding Via header: {str(e)}")
+        return response
+
 # continuously accept connections
 while True:
   print ('Waiting for connection...')
@@ -54,7 +234,7 @@ while True:
     # ~~~~ INSERT CODE ~~~~
     clientSocket, addr = serverSocket.accept()
     # ~~~~ END CODE INSERT ~~~~
-    print ('Received a connection')
+    print ('Received a connection from:', addr)
   except:
     print ('Failed to accept connection')
     sys.exit()
@@ -107,24 +287,53 @@ while True:
 
     fileExists = os.path.isfile(cacheLocation)
     
-    # Check whether the file is currently in the cache
-    cacheFile = open(cacheLocation, "r")
-    cacheData = cacheFile.readlines()
-
-    print ('Cache hit! Loading from cache file: ' + cacheLocation)
-    # ProxyServer finds a cache hit
-    # Send back response to client 
-    # ~~~~ INSERT CODE ~~~~
-    # Send the cached response to the client line by line
-    for line in cacheData:
-        clientSocket.send(line.encode())
-    # ~~~~ END CODE INSERT ~~~~
-    cacheFile.close()
-    print ('Sent to the client:')
-    print ('> ' + ''.join(cacheData))
-  except:
+    # Step 8: Check if cache exists and is valid
+    if fileExists and is_cache_valid(cacheLocation):
+        # Return response from cache
+        print ('Cache hit! Loading from cache file: ' + cacheLocation)
+        
+        # Check if it's a binary file (like an image)
+        try:
+            # Try to open in text mode
+            cacheFile = open(cacheLocation, "r")
+            cacheData = cacheFile.readlines()
+            
+            # Add Via header
+            output = []
+            header_end_found = False
+            for line in cacheData:
+                if line.strip() == "" and not header_end_found:
+                    # Add Via header before empty line (if not already present)
+                    if not any(line.lower().startswith('via:') for line in output):
+                        output.append(f"Via: 1.1 {proxyHost}:{proxyPort} (Python-Proxy)\r\n")
+                    header_end_found = True
+                output.append(line)
+            
+            # Send response to client
+            for line in output:
+                clientSocket.send(line.encode())
+            
+            cacheFile.close()
+            print ('Sent to the client from cache (text mode)')
+        except UnicodeDecodeError:
+            # Likely a binary file, reopen in binary mode
+            with open(cacheLocation, "rb") as binary_file:
+                data = binary_file.read()
+                # Add Via header
+                data_with_via = add_via_header(data)
+                clientSocket.sendall(data_with_via)
+                print ('Sent to the client from cache (binary mode)')
+    else:
+        # Cache miss or expired
+        if fileExists:
+            print("Cache expired or invalid, refetching from origin server")
+        else:
+            print("Cache miss, fetching from origin server")
+        raise FileNotFoundError("Force cache miss")
+            
+  except Exception as e:
     # Cache miss - Step 7: Get resource from origin server
-    print('Cache miss! Fetching from origin server...')
+    print(f'Cache miss or invalid! Fetching from origin server... ({str(e)})')
     originServerSocket = None
     # Create a socket to connect to origin server
     # and store in originServerSocket
@@ -179,24 +388,40 @@ while True:
           response += data      
       # ~~~~ END CODE INSERT ~~~~
 
-      # Send the response to the client
-      # ~~~~ INSERT CODE ~~~~
-      clientSocket.sendall(response)
-      # ~~~~ END CODE INSERT ~~~~
-
-      # Create a new file in the cache for the requested file.
-      cacheDir, file = os.path.split(cacheLocation)
-      print ('Creating cache directory: ' + cacheDir)
-      if not os.path.exists(cacheDir):
-        os.makedirs(cacheDir)
+      # Parse response headers and status code
+      headers, body = parse_headers(response)
+      status_code = headers.get('status_code', 0)
+      print(f"Received response from origin server: {headers.get('status', 'Unknown Status')}")
       
-      # Save origin server response in the cache file
-      # ~~~~ INSERT CODE ~~~~
-      with open(cacheLocation, 'wb') as cacheFile:
-          cacheFile.write(response)
-      # ~~~~ END CODE INSERT ~~~~
-      
-      print('Response saved to cache file: ' + cacheLocation)
+      # Step 8: Handle redirects
+      if status_code in [301, 302, 303, 307, 308]:
+          print(f"Received redirect response (status {status_code})")
+          # Add Via header
+          response_with_via = add_via_header(response)
+          
+          # Send to client
+          clientSocket.sendall(response_with_via)
+          
+          # Check if should be cached
+          if should_cache_response(headers):
+              print(f"Caching redirect response (status {status_code})")
+              save_to_cache(response_with_via, cacheLocation)
+          else:
+              print(f"Not caching redirect response (status {status_code})")
+      else:
+          # Non-redirect response
+          # Add Via header
+          response_with_via = add_via_header(response)
+          
+          # Send to client
+          clientSocket.sendall(response_with_via)
+          
+          # Check if should be cached
+          if should_cache_response(headers):
+              print("Caching response")
+              save_to_cache(response_with_via, cacheLocation)
+          else:
+              print("Not caching response")
 
       # Finished communicating with origin server - shutdown socket writes
       print ('Origin response received. Closing sockets')
@@ -209,6 +434,7 @@ while True:
       # Send error message to client
       errorMsg = "HTTP/1.1 502 Bad Gateway\r\n"
       errorMsg += "Content-Type: text/html\r\n"
+      errorMsg += "Via: 1.1 " + proxyHost + ":" + str(proxyPort) + " (Python-Proxy)\r\n"
       errorMsg += "\r\n"
       errorMsg += "<html><body><h1>502 Bad Gateway</h1>"
       errorMsg += "<p>Error connecting to the origin server</p>"
@@ -219,4 +445,18 @@ while True:
   try:
     clientSocket.close()
   except:
-    print ('Failed to close client socket') 
+    print ('Failed to close client socket')
+
+# Step 9 testing instructions:
+# 1. Test the proxy server using telnet:
+#    telnet proxy_host proxy_port
+#    GET http://example.com/ HTTP/1.1
+#    Host: example.com
+#    (press Enter twice)
+#
+# 2. Test the proxy server using cURL:
+#    curl -v -x proxy_host:proxy_port http://example.com/
+#
+# 3. Capture traffic using Wireshark:
+#    - Filter: host example.com and tcp port 80
+#    - Observe communication between proxy and origin server 
