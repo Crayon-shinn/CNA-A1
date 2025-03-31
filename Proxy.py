@@ -19,8 +19,7 @@ proxyPort = int(args.port)
 # Create a server socket, bind it to a port and start listening
 try:
   # Create a server socket
-  # ~~~~ INSERT CODE ~~~~
-  
+  serverSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
   # ~~~~ END CODE INSERT ~~~~
   print ('Created socket')
 except:
@@ -29,8 +28,7 @@ except:
 
 try:
   # Bind the the server socket to a host and port
-  # ~~~~ INSERT CODE ~~~~
-  
+  serverSocket.bind((proxyHost, proxyPort))
   # ~~~~ END CODE INSERT ~~~~
   print ('Port is bound')
 except:
@@ -39,8 +37,7 @@ except:
 
 try:
   # Listen on the server socket
-  # ~~~~ INSERT CODE ~~~~
-  
+  serverSocket.listen(1)
   # ~~~~ END CODE INSERT ~~~~
   print ('Listening to socket')
 except:
@@ -55,7 +52,7 @@ while True:
   # Accept connection from client and store in the clientSocket
   try:
     # ~~~~ INSERT CODE ~~~~
-    
+    clientSocket, addr = serverSocket.accept()
     # ~~~~ END CODE INSERT ~~~~
     print ('Received a connection')
   except:
@@ -65,7 +62,7 @@ while True:
   # Get HTTP request from client
   # and store it in the variable: message_bytes
   # ~~~~ INSERT CODE ~~~~
-  
+  message_bytes = clientSocket.recv(BUFFER_SIZE)
   # ~~~~ END CODE INSERT ~~~~
   message = message_bytes.decode('utf-8')
   print ('Received request:')
@@ -118,24 +115,106 @@ while True:
     # ProxyServer finds a cache hit
     # Send back response to client 
     # ~~~~ INSERT CODE ~~~~
-    
+    # Send the cached response to the client line by line
+    for line in cacheData:
+        clientSocket.send(line.encode())
     # ~~~~ END CODE INSERT ~~~~
     cacheFile.close()
     print ('Sent to the client:')
     print ('> ' + ''.join(cacheData))
   except:
-    # Cache miss
-    # This part will be implemented in step 7 - for now we'll just return an error
-    print("Cache miss. Need to retrieve resource from origin server (to be implemented in step 7)")
-    # Here you would add code to retrieve resource from origin server
-    # Since we're only implementing up to step 6, we'll return a simple error message
-    errorMsg = "HTTP/1.1 404 Not Found\r\n"
-    errorMsg += "Content-Type: text/html\r\n"
-    errorMsg += "\r\n"
-    errorMsg += "<html><body><h1>404 Not Found</h1>"
-    errorMsg += "<p>Requested resource not available in cache (step 7 not yet implemented)</p>"
-    errorMsg += "</body></html>"
-    clientSocket.send(errorMsg.encode())
+    # Cache miss - Step 7: Get resource from origin server
+    print('Cache miss! Fetching from origin server...')
+    originServerSocket = None
+    # Create a socket to connect to origin server
+    # and store in originServerSocket
+    # ~~~~ INSERT CODE ~~~~
+    originServerSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # ~~~~ END CODE INSERT ~~~~
+
+    print ('Connecting to:\t\t' + hostname + '\n')
+    try:
+      # Get the IP address for a hostname
+      address = socket.gethostbyname(hostname)
+      # Connect to the origin server
+      # ~~~~ INSERT CODE ~~~~
+      originServerSocket.connect((address, 80))
+      # ~~~~ END CODE INSERT ~~~~
+      print ('Connected to origin Server')
+
+      originServerRequest = ''
+      originServerRequestHeader = ''
+      # Create origin server request line and headers to send
+      # and store in originServerRequestHeader and originServerRequest
+      # originServerRequest is the first line in the request and
+      # originServerRequestHeader is the second line in the request
+      # ~~~~ INSERT CODE ~~~~
+      originServerRequest = f'GET {resource} HTTP/1.1'
+      originServerRequestHeader = f'Host: {hostname}\r\nConnection: close'
+      # ~~~~ END CODE INSERT ~~~~
+
+      # Construct the request to send to the origin server
+      request = originServerRequest + '\r\n' + originServerRequestHeader + '\r\n\r\n'
+
+      # Request the web resource from origin server
+      print ('Forwarding request to origin server:')
+      for line in request.split('\r\n'):
+        print ('> ' + line)
+
+      try:
+        originServerSocket.sendall(request.encode())
+      except socket.error:
+        print ('Forward request to origin failed')
+        sys.exit()
+
+      print('Request sent to origin server\n')
+
+      # Get the response from the origin server
+      # ~~~~ INSERT CODE ~~~~
+      response = b''
+      while True:
+          data = originServerSocket.recv(BUFFER_SIZE)
+          if not data:
+              break
+          response += data      
+      # ~~~~ END CODE INSERT ~~~~
+
+      # Send the response to the client
+      # ~~~~ INSERT CODE ~~~~
+      clientSocket.sendall(response)
+      # ~~~~ END CODE INSERT ~~~~
+
+      # Create a new file in the cache for the requested file.
+      cacheDir, file = os.path.split(cacheLocation)
+      print ('Creating cache directory: ' + cacheDir)
+      if not os.path.exists(cacheDir):
+        os.makedirs(cacheDir)
+      
+      # Save origin server response in the cache file
+      # ~~~~ INSERT CODE ~~~~
+      with open(cacheLocation, 'wb') as cacheFile:
+          cacheFile.write(response)
+      # ~~~~ END CODE INSERT ~~~~
+      
+      print('Response saved to cache file: ' + cacheLocation)
+
+      # Finished communicating with origin server - shutdown socket writes
+      print ('Origin response received. Closing sockets')
+      originServerSocket.close()
+       
+      clientSocket.shutdown(socket.SHUT_WR)
+      print ('Client socket shutdown for writing')
+    except OSError as err:
+      print ('Origin server request failed. ' + str(err))
+      # Send error message to client
+      errorMsg = "HTTP/1.1 502 Bad Gateway\r\n"
+      errorMsg += "Content-Type: text/html\r\n"
+      errorMsg += "\r\n"
+      errorMsg += "<html><body><h1>502 Bad Gateway</h1>"
+      errorMsg += "<p>Error connecting to the origin server</p>"
+      errorMsg += "<p>Error details: " + str(err) + "</p>"
+      errorMsg += "</body></html>"
+      clientSocket.send(errorMsg.encode())
 
   try:
     clientSocket.close()
